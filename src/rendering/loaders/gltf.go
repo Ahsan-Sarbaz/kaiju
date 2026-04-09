@@ -37,16 +37,17 @@
 package loaders
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
+	"net/url"
 	"path/filepath"
 	"slices"
 	"strings"
-	"unsafe"
 
 	"kaijuengine.com/engine/assets"
-	"kaijuengine.com/klib"
 	"kaijuengine.com/matrix"
 	"kaijuengine.com/platform/profiler/tracing"
 	"kaijuengine.com/rendering"
@@ -65,60 +66,123 @@ type rawMeshData struct {
 	indices []uint32
 }
 
+func decodeDataURI(uri string) ([]byte, error) {
+	comma := strings.IndexByte(uri, ',')
+	if comma < 0 {
+		return nil, errors.New("invalid data uri")
+	}
+	header := uri[:comma]
+	payload := uri[comma+1:]
+	if strings.HasSuffix(strings.ToLower(header), ";base64") || strings.Contains(strings.ToLower(header), ";base64;") {
+		decoded, err := base64.StdEncoding.DecodeString(payload)
+		if err == nil {
+			return decoded, nil
+		}
+		return base64.RawStdEncoding.DecodeString(payload)
+	}
+	decoded, err := url.PathUnescape(payload)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(decoded), nil
+}
+
+func readExternalOrDataURI(root, uri string, assetDB assets.Database) ([]byte, error) {
+	if uri == "" {
+		return nil, errors.New("empty uri")
+	}
+	if strings.HasPrefix(strings.ToLower(uri), "data:") {
+		return decodeDataURI(uri)
+	}
+	path := filepath.Join(root, filepath.FromSlash(uri))
+	return assetDB.Read(path)
+}
+
 func readFileGLB(file string, assetDB assets.Database) (fullGLTF, error) {
 	defer tracing.NewRegion("loaders.readFileGLB").End()
-	const headSize = 12
-	const chunkHeadSize = 8
+
+	const headerSize = 12
+	const chunkHeaderSize = 8
+
 	g := fullGLTF{path: file}
 	data, err := assetDB.Read(file)
 	if err != nil {
 		return g, err
 	}
-	if len(data) < headSize {
+	if len(data) < headerSize {
 		return g, errors.New("invalid glb file")
 	}
-	magic := data[:4]
-	// version := binary.LittleEndian.Uint32(data[4:8])
-	// length := binary.LittleEndian.Uint32(data[8:12])
-	if string(magic) != "glTF" {
+	if string(data[:4]) != "glTF" {
 		return g, errors.New("invalid glb file")
 	}
-	jsonData := data[headSize:]
-	if len(jsonData) < 8 {
-		return g, errors.New("invalid glb file")
+	version := binary.LittleEndian.Uint32(data[4:8])
+	if version != 2 {
+		return g, fmt.Errorf("unsupported glb version: %d", version)
 	}
-	chunkLen := binary.LittleEndian.Uint32(jsonData[:4])
-	chunkType := jsonData[4:8]
-	if string(chunkType) != "JSON" {
-		return g, errors.New("invalid glb file")
+	declaredLength := binary.LittleEndian.Uint32(data[8:12])
+	if int(declaredLength) != len(data) {
+		return g, errors.New("invalid glb file length")
 	}
-	jsonData = jsonData[:chunkHeadSize+chunkLen]
-	jsonStr := string(jsonData[chunkHeadSize:])
-	g.glTF, err = gltf.LoadGLTF(jsonStr)
+
+	var jsonChunk []byte
+	var binChunk []byte
+	cursor := headerSize
+	for cursor < len(data) {
+		if len(data[cursor:]) < chunkHeaderSize {
+			return g, errors.New("invalid glb chunk header")
+		}
+		chunkLen := int(binary.LittleEndian.Uint32(data[cursor : cursor+4]))
+		chunkType := string(data[cursor+4 : cursor+8])
+		cursor += chunkHeaderSize
+		if chunkLen < 0 || cursor+chunkLen > len(data) {
+			return g, errors.New("invalid glb chunk size")
+		}
+		chunkData := data[cursor : cursor+chunkLen]
+		cursor += chunkLen
+		switch chunkType {
+		case "JSON":
+			if jsonChunk == nil {
+				jsonChunk = chunkData
+			}
+		case "BIN\x00":
+			if binChunk == nil {
+				binChunk = chunkData
+			}
+		}
+	}
+	if len(jsonChunk) == 0 {
+		return g, errors.New("glb missing json chunk")
+	}
+
+	g.glTF, err = gltf.LoadGLTF(string(jsonChunk))
 	if err != nil {
 		return g, err
 	}
 	g.glTF.Asset.FilePath = file
-	bins := data[headSize+len(jsonData):]
-	if len(bins) < chunkHeadSize {
-		return g, errors.New("invalid glb file")
-	}
-	chunkLen = binary.LittleEndian.Uint32(bins[:4])
-	chunkType = bins[4:8]
-	if string(chunkType) != "BIN\000" {
-		return g, errors.New("invalid glb file")
-	}
-	bins = bins[chunkHeadSize:]
 	g.bins = make([][]byte, len(g.glTF.Buffers))
+	root := filepath.Dir(file)
 	for i, buffer := range g.glTF.Buffers {
-		if buffer.ByteLength == 0 {
-			continue
+		switch {
+		case buffer.URI == "" && i == 0:
+			g.bins[i] = binChunk
+		case buffer.URI == "":
+			if buffer.ByteLength != 0 {
+				return g, fmt.Errorf("buffer %d has no uri and no glb bin chunk", i)
+			}
+		case strings.HasPrefix(strings.ToLower(buffer.URI), "data:"):
+			g.bins[i], err = decodeDataURI(buffer.URI)
+			if err != nil {
+				return g, err
+			}
+		default:
+			g.bins[i], err = readExternalOrDataURI(root, buffer.URI, assetDB)
+			if err != nil {
+				return g, err
+			}
 		}
-		if len(bins) < int(buffer.ByteLength) {
-			return g, errors.New("invalid glb file")
+		if int(buffer.ByteLength) > len(g.bins[i]) {
+			return g, fmt.Errorf("buffer %d shorter than declared byteLength", i)
 		}
-		g.bins[i] = bins[:buffer.ByteLength]
-		bins = bins[buffer.ByteLength:]
 	}
 	return g, nil
 }
@@ -137,14 +201,19 @@ func readFileGLTF(file string, assetDB assets.Database) (fullGLTF, error) {
 	g.glTF.Asset.FilePath = file
 	g.bins = make([][]byte, len(g.glTF.Buffers))
 	root := filepath.Dir(file)
-	for i, path := range g.glTF.Buffers {
-		uri := filepath.Join(root, path.URI)
-		if !assetDB.Exists(uri) {
-			return g, errors.New("bin file (" + uri + ") does not exist")
+	for i, buffer := range g.glTF.Buffers {
+		if buffer.URI == "" {
+			if buffer.ByteLength != 0 {
+				return g, fmt.Errorf("buffer %d is missing uri", i)
+			}
+			continue
 		}
-		g.bins[i], err = assetDB.Read(uri)
+		g.bins[i], err = readExternalOrDataURI(root, buffer.URI, assetDB)
 		if err != nil {
 			return g, err
+		}
+		if int(buffer.ByteLength) > len(g.bins[i]) {
+			return g, fmt.Errorf("buffer %d shorter than declared byteLength", i)
 		}
 	}
 	return g, nil
@@ -154,86 +223,130 @@ func GLTF(path string, assetDB assets.Database) (load_result.Result, error) {
 	defer tracing.NewRegion("loaders.GLTF").End()
 	if !assetDB.Exists(path) {
 		return load_result.Result{}, errors.New("file does not exist")
-	} else if filepath.Ext(path) == ".glb" {
-		if g, err := readFileGLB(path, assetDB); err != nil {
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".glb":
+		g, err := readFileGLB(path, assetDB)
+		if err != nil {
 			return load_result.Result{}, err
-		} else {
-			return gltfParse(&g)
 		}
-	} else if filepath.Ext(path) == ".gltf" {
-		if g, err := readFileGLTF(path, assetDB); err != nil {
+		return gltfParse(&g)
+	case ".gltf":
+		g, err := readFileGLTF(path, assetDB)
+		if err != nil {
 			return load_result.Result{}, err
-		} else {
-			return gltfParse(&g)
 		}
-	} else {
+		return gltfParse(&g)
+	default:
 		return load_result.Result{}, errors.New("invalid file extension")
 	}
 }
 
 func gltfParse(doc *fullGLTF) (load_result.Result, error) {
 	defer tracing.NewRegion("loaders.gltfParse").End()
+	if doc.glTF.Asset.Version != "2.0" {
+		return load_result.Result{}, fmt.Errorf("unsupported glTF version %q, expected 2.0", doc.glTF.Asset.Version)
+	}
 	res := load_result.Result{}
 	res.Nodes = make([]load_result.Node, len(doc.glTF.Nodes))
 	for i := range res.Nodes {
 		res.Nodes[i].Parent = -1
 		res.Nodes[i].Attributes = make(map[string]any)
+		res.Nodes[i].Scale = matrix.Vec3One()
+		res.Nodes[i].Rotation = matrix.QuaternionIdentity()
 	}
-	// TODO:  Deal with multiple skins
+
+	// TODO: Deal with multiple skins.
 	if len(doc.glTF.Skins) > 0 {
-		skinAcc := doc.glTF.Accessors[doc.glTF.Skins[0].InverseBindMatrices]
-		bv := doc.glTF.BufferViews[skinAcc.BufferView]
-		bin := klib.ByteSliceToFloat32Slice(gltfViewBytes(doc, &bv))
-		for _, id := range doc.glTF.Skins[0].Joints {
-			if !strings.HasPrefix(doc.glTF.Nodes[id].Name, "DRV_") &&
-				!strings.HasPrefix(doc.glTF.Nodes[id].Name, "CTRL_") {
-				res.Joints = append(res.Joints, load_result.Joint{
-					Id:   id,
-					Skin: matrix.Mat4FromSlice(bin),
-				})
+		skin := &doc.glTF.Skins[0]
+		bindMats := make([]matrix.Mat4, 0, len(skin.Joints))
+		if skin.InverseBindMatrices != nil {
+			acc, err := gltfAccessorByIntIndex(doc, *skin.InverseBindMatrices)
+			if err != nil {
+				return res, err
 			}
-			bin = bin[16:]
+			if acc.ComponentType != gltf.FLOAT || acc.Type != gltf.MAT4 {
+				return res, errors.New("inverse bind matrices accessor must be float MAT4")
+			}
+			floats, err := gltfReadAccessorFloats(doc, acc)
+			if err != nil {
+				return res, err
+			}
+			for i := 0; i+15 < len(floats); i += 16 {
+				bindMats = append(bindMats, matrix.Mat4FromSlice([]matrix.Float{
+					matrix.Float(floats[i+0]), matrix.Float(floats[i+1]), matrix.Float(floats[i+2]), matrix.Float(floats[i+3]),
+					matrix.Float(floats[i+4]), matrix.Float(floats[i+5]), matrix.Float(floats[i+6]), matrix.Float(floats[i+7]),
+					matrix.Float(floats[i+8]), matrix.Float(floats[i+9]), matrix.Float(floats[i+10]), matrix.Float(floats[i+11]),
+					matrix.Float(floats[i+12]), matrix.Float(floats[i+13]), matrix.Float(floats[i+14]), matrix.Float(floats[i+15]),
+				}))
+			}
+		}
+		for i, id := range skin.Joints {
+			if id < 0 || int(id) >= len(doc.glTF.Nodes) {
+				return res, fmt.Errorf("invalid joint node index %d", id)
+			}
+			if strings.HasPrefix(doc.glTF.Nodes[id].Name, "DRV_") || strings.HasPrefix(doc.glTF.Nodes[id].Name, "CTRL_") {
+				continue
+			}
+			jointMat := matrix.Mat4Identity()
+			if i < len(bindMats) {
+				jointMat = bindMats[i]
+			}
+			res.Joints = append(res.Joints, load_result.Joint{Id: id, Skin: jointMat})
 		}
 	}
+
 	for i := range doc.glTF.Nodes {
 		n := &doc.glTF.Nodes[i]
 		res.Nodes[i].Id = int32(i)
 		res.Nodes[i].Name = n.Name
-		res.Nodes[i].Attributes = n.Extras
-		for j := range n.Children {
-			cid := n.Children[j]
-			res.Nodes[cid].Parent = i
+		if n.Extras != nil {
+			res.Nodes[i].Attributes = n.Extras
 		}
-		// TODO:  Come back for this scenario
-		//if n.Matrix != nil {
-		//}
-		if n.Scale != nil {
-			res.Nodes[i].Scale = *n.Scale
+		for _, childID := range n.Children {
+			if childID < 0 || int(childID) >= len(res.Nodes) {
+				return res, fmt.Errorf("invalid child node index %d", childID)
+			}
+			res.Nodes[childID].Parent = i
+		}
+		if n.Matrix != nil {
+			res.Nodes[i].Position = n.Matrix.ExtractPosition()
+			res.Nodes[i].Scale = n.Matrix.ExtractScale()
+			res.Nodes[i].Rotation = n.Matrix.ExtractRotation()
 		} else {
-			res.Nodes[i].Scale = matrix.Vec3One()
-		}
-		if n.Rotation != nil {
-			res.Nodes[i].Rotation = matrix.QuaternionFromXYZW(*n.Rotation)
-		} else {
-			res.Nodes[i].Rotation = matrix.QuaternionIdentity()
-		}
-		if n.Translation != nil {
-			res.Nodes[i].Position = *n.Translation
+			if n.Scale != nil {
+				res.Nodes[i].Scale = *n.Scale
+			}
+			if n.Rotation != nil {
+				res.Nodes[i].Rotation = matrix.QuaternionFromXYZW(*n.Rotation)
+			}
+			if n.Translation != nil {
+				res.Nodes[i].Position = *n.Translation
+			}
 		}
 		if n.Mesh == nil {
 			continue
 		}
+		if *n.Mesh < 0 || int(*n.Mesh) >= len(doc.glTF.Meshes) {
+			return res, fmt.Errorf("invalid mesh index %d", *n.Mesh)
+		}
 		m := &doc.glTF.Meshes[*n.Mesh]
 		for p := range m.Primitives {
-			rmd := new(rawMeshData)
-			if verts, err := gltfReadMeshVerts(m, doc, p); err != nil {
-				return res, err
-			} else if indices, err := gltfReadMeshIndices(m, doc, p); err != nil {
-				return res, err
-			} else {
-				rmd.verts = verts
-				rmd.indices = indices
+			prim := &m.Primitives[p]
+			if prim.Mode != 0 && prim.Mode != 4 {
+				continue
 			}
+			rmd := new(rawMeshData)
+			verts, err := gltfReadMeshVerts(m, doc, p)
+			if err != nil {
+				return res, err
+			}
+			indices, err := gltfReadMeshIndices(m, doc, p, len(verts))
+			if err != nil {
+				return res, err
+			}
+			rmd.verts = verts
+			rmd.indices = indices
 			textures := gltfReadMeshTextures(m, &doc.glTF, p)
 			key := fmt.Sprintf("%s/%s", doc.path, m.Name)
 			if p > 0 {
@@ -242,10 +355,14 @@ func gltfParse(doc *fullGLTF) (load_result.Result, error) {
 			res.Add(n.Name, key, rmd.verts, rmd.indices, textures, &res.Nodes[i])
 		}
 	}
+
 	res.Animations = gltfReadAnimations(doc)
 	for i := range doc.glTF.Animations {
 		for j := range doc.glTF.Animations[i].Channels {
 			nid := doc.glTF.Animations[i].Channels[j].Target.Node
+			if nid < 0 || int(nid) >= len(res.Nodes) {
+				continue
+			}
 			res.Nodes[nid].IsAnimated = true
 			p := res.Nodes[nid].Parent
 			for p >= 0 {
@@ -263,268 +380,609 @@ func gltfAttr(primitive gltf.Primitive, cmp string) (uint32, bool) {
 	return idx, ok
 }
 
-func gltfViewBytes(doc *fullGLTF, view *gltf.BufferView) []byte {
-	defer tracing.NewRegion("loaders.gltfViewBytes").End()
-	return doc.bins[view.Buffer][view.ByteOffset : view.ByteOffset+view.ByteLength]
+func gltfAccessorByIntIndex(doc *fullGLTF, idx int32) (*gltf.Accessor, error) {
+	if idx < 0 || int(idx) >= len(doc.glTF.Accessors) {
+		return nil, fmt.Errorf("invalid accessor index %d", idx)
+	}
+	return &doc.glTF.Accessors[idx], nil
 }
 
-func gltfReadMeshMorphTargets(mesh *gltf.Mesh, doc *fullGLTF, verts []rendering.Vertex) klib.ErrorList {
+func gltfAccessorByUintIndex(doc *fullGLTF, idx uint32) (*gltf.Accessor, error) {
+	if int(idx) >= len(doc.glTF.Accessors) {
+		return nil, fmt.Errorf("invalid accessor index %d", idx)
+	}
+	return &doc.glTF.Accessors[idx], nil
+}
+
+func gltfAccessorComponentCount(acc *gltf.Accessor) (int, error) {
+	switch acc.Type {
+	case gltf.SCALAR:
+		return 1, nil
+	case gltf.VEC2:
+		return 2, nil
+	case gltf.VEC3:
+		return 3, nil
+	case gltf.VEC4, gltf.MAT2:
+		return 4, nil
+	case gltf.MAT3:
+		return 9, nil
+	case gltf.MAT4:
+		return 16, nil
+	default:
+		return 0, fmt.Errorf("unsupported accessor type %q", acc.Type)
+	}
+}
+
+func gltfComponentByteSize(componentType gltf.ComponentType) (int, error) {
+	switch componentType {
+	case gltf.BYTE, gltf.UNSIGNED_BYTE:
+		return 1, nil
+	case gltf.SHORT, gltf.UNSIGNED_SHORT:
+		return 2, nil
+	case gltf.UNSIGNED_INT, gltf.FLOAT:
+		return 4, nil
+	default:
+		return 0, fmt.Errorf("unsupported component type %d", componentType)
+	}
+}
+
+func gltfAccessorLayout(doc *fullGLTF, acc *gltf.Accessor) ([]byte, int, int, int, error) {
+	if acc == nil {
+		return nil, 0, 0, 0, errors.New("nil accessor")
+	}
+	if acc.Count < 0 {
+		return nil, 0, 0, 0, errors.New("invalid accessor count")
+	}
+	compCount, err := gltfAccessorComponentCount(acc)
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	compSize, err := gltfComponentByteSize(acc.ComponentType)
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	elemSize := compCount * compSize
+	count := int(acc.Count)
+
+	// Read base data from bufferView (or start with zeroes if absent).
+	var base []byte
+	stride := elemSize
+	if acc.BufferView != nil {
+		viewIdx := *acc.BufferView
+		if viewIdx < 0 || int(viewIdx) >= len(doc.glTF.BufferViews) {
+			return nil, 0, 0, 0, fmt.Errorf("invalid buffer view index %d", viewIdx)
+		}
+		view := &doc.glTF.BufferViews[viewIdx]
+		if view.Buffer < 0 || int(view.Buffer) >= len(doc.bins) {
+			return nil, 0, 0, 0, fmt.Errorf("invalid buffer index %d", view.Buffer)
+		}
+		buffer := doc.bins[view.Buffer]
+		bvStride := int(view.ByteStride)
+		if bvStride == 0 {
+			bvStride = elemSize
+		}
+		if bvStride < elemSize {
+			return nil, 0, 0, 0, errors.New("buffer view stride smaller than accessor element size")
+		}
+		start := int(view.ByteOffset + acc.ByteOffset)
+		viewEnd := int(view.ByteOffset + view.ByteLength)
+		if start < 0 || start > len(buffer) || viewEnd < start || viewEnd > len(buffer) {
+			return nil, 0, 0, 0, errors.New("invalid accessor byte range")
+		}
+		if count == 0 {
+			if acc.Sparse == nil {
+				return buffer[start:start], elemSize, bvStride, 0, nil
+			}
+			return make([]byte, 0), elemSize, elemSize, 0, nil
+		}
+		end := start + (count-1)*bvStride + elemSize
+		if end > viewEnd || end > len(buffer) {
+			return nil, 0, 0, 0, errors.New("accessor exceeds buffer view")
+		}
+		if acc.Sparse == nil {
+			return buffer[start:end], elemSize, bvStride, count, nil
+		}
+		// Need a flat copy to apply sparse overrides.
+		base = make([]byte, count*elemSize)
+		for i := 0; i < count; i++ {
+			copy(base[i*elemSize:], buffer[start+i*bvStride:start+i*bvStride+elemSize])
+		}
+		stride = elemSize
+	} else if acc.Sparse == nil {
+		return nil, 0, 0, 0, errors.New("accessor has no bufferView and no sparse data")
+	} else {
+		base = make([]byte, count*elemSize)
+	}
+
+	// Apply sparse overrides.
+	sp := acc.Sparse
+	if sp.Count <= 0 {
+		return base, elemSize, stride, count, nil
+	}
+	// Read sparse indices.
+	idxSize, err := gltfComponentByteSize(sp.Indices.ComponentType)
+	if err != nil {
+		return nil, 0, 0, 0, fmt.Errorf("sparse indices: %w", err)
+	}
+	idxBVIdx := sp.Indices.BufferView
+	if idxBVIdx < 0 || int(idxBVIdx) >= len(doc.glTF.BufferViews) {
+		return nil, 0, 0, 0, fmt.Errorf("sparse indices: invalid buffer view index %d", idxBVIdx)
+	}
+	idxBV := &doc.glTF.BufferViews[idxBVIdx]
+	if idxBV.Buffer < 0 || int(idxBV.Buffer) >= len(doc.bins) {
+		return nil, 0, 0, 0, fmt.Errorf("sparse indices: invalid buffer index %d", idxBV.Buffer)
+	}
+	idxBuf := doc.bins[idxBV.Buffer]
+	idxStart := int(idxBV.ByteOffset + sp.Indices.ByteOffset)
+	idxEnd := idxStart + int(sp.Count)*idxSize
+	if idxStart < 0 || idxEnd > len(idxBuf) {
+		return nil, 0, 0, 0, errors.New("sparse indices out of buffer bounds")
+	}
+	// Read sparse values.
+	valBVIdx := sp.Values.BufferView
+	if valBVIdx < 0 || int(valBVIdx) >= len(doc.glTF.BufferViews) {
+		return nil, 0, 0, 0, fmt.Errorf("sparse values: invalid buffer view index %d", valBVIdx)
+	}
+	valBV := &doc.glTF.BufferViews[valBVIdx]
+	if valBV.Buffer < 0 || int(valBV.Buffer) >= len(doc.bins) {
+		return nil, 0, 0, 0, fmt.Errorf("sparse values: invalid buffer index %d", valBV.Buffer)
+	}
+	valBuf := doc.bins[valBV.Buffer]
+	valStart := int(valBV.ByteOffset + sp.Values.ByteOffset)
+	valEnd := valStart + int(sp.Count)*elemSize
+	if valStart < 0 || valEnd > len(valBuf) {
+		return nil, 0, 0, 0, errors.New("sparse values out of buffer bounds")
+	}
+	for j := 0; j < int(sp.Count); j++ {
+		var elemIdx int
+		switch sp.Indices.ComponentType {
+		case gltf.UNSIGNED_BYTE:
+			elemIdx = int(idxBuf[idxStart+j])
+		case gltf.UNSIGNED_SHORT:
+			elemIdx = int(binary.LittleEndian.Uint16(idxBuf[idxStart+j*2:]))
+		case gltf.UNSIGNED_INT:
+			elemIdx = int(binary.LittleEndian.Uint32(idxBuf[idxStart+j*4:]))
+		default:
+			return nil, 0, 0, 0, fmt.Errorf("sparse indices: unsupported component type %d", sp.Indices.ComponentType)
+		}
+		if elemIdx < 0 || elemIdx >= count {
+			return nil, 0, 0, 0, fmt.Errorf("sparse index %d out of accessor range", elemIdx)
+		}
+		copy(base[elemIdx*elemSize:], valBuf[valStart+j*elemSize:valStart+j*elemSize+elemSize])
+	}
+	return base, elemSize, stride, count, nil
+}
+
+func gltfReadScalarFloat(data []byte, componentType gltf.ComponentType, normalized bool) (float32, error) {
+	switch componentType {
+	case gltf.BYTE:
+		v := float32(int8(data[0]))
+		if normalized {
+			if v <= -128 {
+				return -1, nil
+			}
+			return v / 127.0, nil
+		}
+		return v, nil
+	case gltf.UNSIGNED_BYTE:
+		v := float32(data[0])
+		if normalized {
+			return v / 255.0, nil
+		}
+		return v, nil
+	case gltf.SHORT:
+		v := float32(int16(binary.LittleEndian.Uint16(data[:2])))
+		if normalized {
+			if v <= -32768 {
+				return -1, nil
+			}
+			return v / 32767.0, nil
+		}
+		return v, nil
+	case gltf.UNSIGNED_SHORT:
+		v := float32(binary.LittleEndian.Uint16(data[:2]))
+		if normalized {
+			return v / 65535.0, nil
+		}
+		return v, nil
+	case gltf.UNSIGNED_INT:
+		v := binary.LittleEndian.Uint32(data[:4])
+		if normalized {
+			return float32(float64(v) / float64(^uint32(0))), nil
+		}
+		return float32(v), nil
+	case gltf.FLOAT:
+		return math.Float32frombits(binary.LittleEndian.Uint32(data[:4])), nil
+	default:
+		return 0, fmt.Errorf("unsupported component type %d", componentType)
+	}
+}
+
+func gltfReadScalarInt32(data []byte, componentType gltf.ComponentType) (int32, error) {
+	switch componentType {
+	case gltf.BYTE:
+		return int32(int8(data[0])), nil
+	case gltf.UNSIGNED_BYTE:
+		return int32(data[0]), nil
+	case gltf.SHORT:
+		return int32(int16(binary.LittleEndian.Uint16(data[:2]))), nil
+	case gltf.UNSIGNED_SHORT:
+		return int32(binary.LittleEndian.Uint16(data[:2])), nil
+	case gltf.UNSIGNED_INT:
+		return int32(binary.LittleEndian.Uint32(data[:4])), nil
+	default:
+		return 0, fmt.Errorf("unsupported integer component type %d", componentType)
+	}
+}
+
+func gltfReadAccessorFloats(doc *fullGLTF, acc *gltf.Accessor) ([]float32, error) {
+	bytes, _, stride, count, err := gltfAccessorLayout(doc, acc)
+	if err != nil {
+		return nil, err
+	}
+	compCount, err := gltfAccessorComponentCount(acc)
+	if err != nil {
+		return nil, err
+	}
+	compSize, err := gltfComponentByteSize(acc.ComponentType)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]float32, count*compCount)
+	for i := 0; i < count; i++ {
+		base := i * stride
+		for c := 0; c < compCount; c++ {
+			v, err := gltfReadScalarFloat(bytes[base+c*compSize:], acc.ComponentType, acc.Normalized)
+			if err != nil {
+				return nil, err
+			}
+			out[i*compCount+c] = v
+		}
+	}
+	return out, nil
+}
+
+func gltfReadAccessorInts(doc *fullGLTF, acc *gltf.Accessor) ([]int32, error) {
+	bytes, _, stride, count, err := gltfAccessorLayout(doc, acc)
+	if err != nil {
+		return nil, err
+	}
+	compCount, err := gltfAccessorComponentCount(acc)
+	if err != nil {
+		return nil, err
+	}
+	compSize, err := gltfComponentByteSize(acc.ComponentType)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]int32, count*compCount)
+	for i := 0; i < count; i++ {
+		base := i * stride
+		for c := 0; c < compCount; c++ {
+			v, err := gltfReadScalarInt32(bytes[base+c*compSize:], acc.ComponentType)
+			if err != nil {
+				return nil, err
+			}
+			out[i*compCount+c] = v
+		}
+	}
+	return out, nil
+}
+
+func gltfReadMeshMorphTargets(mesh *gltf.Mesh, doc *fullGLTF, primitive int, verts []rendering.Vertex) error {
 	defer tracing.NewRegion("loaders.gltfReadMeshMorphTargets").End()
-	errs := klib.NewErrorList()
-	for _, target := range mesh.Primitives[0].Targets {
+	if primitive < 0 || primitive >= len(mesh.Primitives) {
+		return fmt.Errorf("invalid primitive index %d", primitive)
+	}
+	for _, target := range mesh.Primitives[primitive].Targets {
 		if target.POSITION == nil {
 			continue
 		}
-		acc := doc.glTF.Accessors[*target.POSITION]
-		if len(doc.glTF.BufferViews) <= int(acc.BufferView) {
-			errs.AddAny(errors.New("invalid buffer view index"))
+		acc, err := gltfAccessorByIntIndex(doc, *target.POSITION)
+		if err != nil {
+			return err
 		}
-		view := doc.glTF.BufferViews[acc.BufferView]
-		if acc.Count <= 0 {
-			errs.AddAny(errors.New("invalid accessor count"))
-			continue
+		if acc.ComponentType != gltf.FLOAT || acc.Type != gltf.VEC3 {
+			return errors.New("morph target position accessor must be float VEC3")
 		}
-		targets := gltfViewBytes(doc, &view)
-		const v3Size = int(unsafe.Sizeof([3]float32{}))
-		if int(acc.Count) != len(verts) || len(targets)/v3Size != len(verts) {
-			errs.AddAny(errors.New("morph targets do not match vert count"))
-			continue
+		floats, err := gltfReadAccessorFloats(doc, acc)
+		if err != nil {
+			return err
 		}
-		floats := klib.ConvertByteSliceType[float32](targets)
-		for i := 0; i < len(verts); i++ {
-			verts[i].MorphTarget = matrix.Vec3{
-				floats[i*3+0],
-				floats[i*3+1],
-				floats[i*3+2],
-			}
+		if int(acc.Count) != len(verts) || len(floats) != len(verts)*3 {
+			return errors.New("morph targets do not match vert count")
 		}
+		for i := range verts {
+			verts[i].MorphTarget = matrix.NewVec3(
+				matrix.Float(floats[i*3+0]),
+				matrix.Float(floats[i*3+1]),
+				matrix.Float(floats[i*3+2]),
+			)
+		}
+		return nil // Vertex currently only stores a single morph target.
 	}
-	return errs
+	return nil
 }
 
 func gltfReadMeshVerts(mesh *gltf.Mesh, doc *fullGLTF, primitive int) ([]rendering.Vertex, error) {
 	defer tracing.NewRegion("loaders.gltfReadMeshVerts").End()
-	var pos, nml, tan, tex0, tex1, jnt0, wei0 *gltf.BufferView
-	var posAcc, nmlAcc, tanAcc, tex0Acc, tex1Acc, jnt0Acc, wei0Acc *gltf.Accessor
-	g := &doc.glTF
-	if idx, ok := gltfAttr(mesh.Primitives[primitive], gltf.POSITION); ok {
-		pos = &g.BufferViews[idx]
-		posAcc = &g.Accessors[idx]
+	if primitive < 0 || primitive >= len(mesh.Primitives) {
+		return nil, fmt.Errorf("invalid primitive index %d", primitive)
 	}
-	if idx, ok := gltfAttr(mesh.Primitives[primitive], gltf.NORMAL); ok {
-		nml = &g.BufferViews[idx]
-		nmlAcc = &g.Accessors[idx]
+	prim := mesh.Primitives[primitive]
+	posIdx, ok := gltfAttr(prim, gltf.POSITION)
+	if !ok {
+		return nil, errors.New("mesh primitive missing POSITION attribute")
 	}
-	if idx, ok := gltfAttr(mesh.Primitives[primitive], gltf.TANGENT); ok {
-		tan = &g.BufferViews[idx]
-		tanAcc = &g.Accessors[idx]
+	posAcc, err := gltfAccessorByUintIndex(doc, posIdx)
+	if err != nil {
+		return nil, err
 	}
-	if idx, ok := gltfAttr(mesh.Primitives[primitive], gltf.TEXCOORD_0); ok {
-		tex0 = &g.BufferViews[idx]
-		tex0Acc = &g.Accessors[idx]
+	if posAcc.ComponentType != gltf.FLOAT || posAcc.Type != gltf.VEC3 {
+		return nil, errors.New("POSITION accessor must be float VEC3")
 	}
-	if idx, ok := gltfAttr(mesh.Primitives[primitive], gltf.TEXCOORD_1); ok {
-		tex1 = &g.BufferViews[idx]
-		tex1Acc = &g.Accessors[idx]
+	positions, err := gltfReadAccessorFloats(doc, posAcc)
+	if err != nil {
+		return nil, err
 	}
-	if idx, ok := gltfAttr(mesh.Primitives[primitive], gltf.JOINTS_0); ok {
-		jnt0 = &g.BufferViews[idx]
-		jnt0Acc = &g.Accessors[idx]
-	}
-	if idx, ok := gltfAttr(mesh.Primitives[primitive], gltf.WEIGHTS_0); ok {
-		wei0 = &g.BufferViews[idx]
-		wei0Acc = &g.Accessors[idx]
+	vertCount := int(posAcc.Count)
+	if vertCount <= 0 {
+		return nil, errors.New("vertCount <= 0")
 	}
 
-	// TODO:  Probably need to support multiple buffers, but they are NULL?
-	verts := klib.ByteSliceToFloat32Slice(gltfViewBytes(doc, pos))
-	vertNormals := klib.ByteSliceToFloat32Slice(gltfViewBytes(doc, nml))
+	var normals []float32
+	if idx, ok := gltfAttr(prim, gltf.NORMAL); ok {
+		acc, err := gltfAccessorByUintIndex(doc, idx)
+		if err != nil {
+			return nil, err
+		}
+		if acc.ComponentType != gltf.FLOAT || acc.Type != gltf.VEC3 {
+			return nil, errors.New("NORMAL accessor must be float VEC3")
+		}
+		normals, err = gltfReadAccessorFloats(doc, acc)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var tangents []float32
+	if idx, ok := gltfAttr(prim, gltf.TANGENT); ok {
+		acc, err := gltfAccessorByUintIndex(doc, idx)
+		if err != nil {
+			return nil, err
+		}
+		if acc.ComponentType != gltf.FLOAT || acc.Type != gltf.VEC4 {
+			return nil, errors.New("TANGENT accessor must be float VEC4")
+		}
+		tangents, err = gltfReadAccessorFloats(doc, acc)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	var texCoords0 []float32
-	var tangent []float32
-	if tex0 != nil {
-		texCoords0 = klib.ByteSliceToFloat32Slice(gltfViewBytes(doc, tex0))
-	} else {
-		texCoords0 = nil
-	}
-	if tan != nil {
-		tangent = klib.ByteSliceToFloat32Slice(gltfViewBytes(doc, tan))
-	} else {
-		tangent = nil
-	}
-	// const uint8_t* vertColors = col0 != NULL
-	//	? (uint8_t*)gltfData.bin + col0.data.buffer_view.offset : NULL;
-	jointIds := make([]byte, 0)
-	weights := make([]float32, 0)
-	if jnt0 != nil {
-		jointIds = gltfViewBytes(doc, jnt0)
-		weights = klib.ByteSliceToFloat32Slice(gltfViewBytes(doc, wei0))
+	if idx, ok := gltfAttr(prim, gltf.TEXCOORD_0); ok {
+		acc, err := gltfAccessorByUintIndex(doc, idx)
+		if err != nil {
+			return nil, err
+		}
+		if acc.Type != gltf.VEC2 {
+			return nil, errors.New("TEXCOORD_0 accessor must be VEC2")
+		}
+		texCoords0, err = gltfReadAccessorFloats(doc, acc)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	// size_t vertNormalsSize = nml.data.buffer_view.size;
-	// size_t texCoords0Size = tex0.data.buffer_view.size;
-	// size_t texCoords1Size = tex1 == NULL ? 0 : tex1.data.buffer_view.size;
-	// size_t vertTangentSize = tan == NULL ? 0 : tan.data.buffer_view.size;
-	// size_t vertColorsSize = col0 == NULL ? 0 : col0.data.buffer_view.size;
-	vertCount := posAcc.Count
-	if !(vertCount > 0) {
-		return []rendering.Vertex{}, errors.New("vertCount <= 0")
+	var jointIDs []int32
+	var weights []float32
+	jointsPresent := false
+	weightsPresent := false
+	if idx, ok := gltfAttr(prim, gltf.JOINTS_0); ok {
+		jointsPresent = true
+		acc, err := gltfAccessorByUintIndex(doc, idx)
+		if err != nil {
+			return nil, err
+		}
+		if acc.Type != gltf.VEC4 {
+			return nil, errors.New("JOINTS_0 accessor must be VEC4")
+		}
+		jointIDs, err = gltfReadAccessorInts(doc, acc)
+		if err != nil {
+			return nil, err
+		}
 	}
-	if !(posAcc.ComponentType == gltf.FLOAT && posAcc.Type == gltf.VEC3) {
-		return []rendering.Vertex{}, errors.New("posAcc.ComponentType != gltf.ComponentFloat || posAcc.Type != gltf.AccessorVec3")
+	if idx, ok := gltfAttr(prim, gltf.WEIGHTS_0); ok {
+		weightsPresent = true
+		acc, err := gltfAccessorByUintIndex(doc, idx)
+		if err != nil {
+			return nil, err
+		}
+		if acc.Type != gltf.VEC4 {
+			return nil, errors.New("WEIGHTS_0 accessor must be VEC4")
+		}
+		weights, err = gltfReadAccessorFloats(doc, acc)
+		if err != nil {
+			return nil, err
+		}
 	}
-	if !(wei0 == nil || wei0Acc.ComponentType == gltf.FLOAT && wei0Acc.Type == gltf.VEC4) {
-		return []rendering.Vertex{}, errors.New("wei0 == NULL || wei0Acc.ComponentType == gltf.ComponentFloat && wei0Acc.Type == gltf.AccessorVec4")
+	if jointsPresent != weightsPresent {
+		return nil, errors.New("JOINTS_0 and WEIGHTS_0 must both be present")
 	}
-	if !(nmlAcc.ComponentType == gltf.FLOAT && nmlAcc.Type == gltf.VEC3) {
-		return []rendering.Vertex{}, errors.New("nmlAcc.ComponentType != gltf.ComponentFloat || nmlAcc.Type != gltf.AccessorVec3")
+
+	var colors0 []float32
+	colors0IsVec4 := false
+	if idx, ok := gltfAttr(prim, gltf.COLOR_0); ok {
+		acc, err := gltfAccessorByUintIndex(doc, idx)
+		if err != nil {
+			return nil, err
+		}
+		if acc.Type != gltf.VEC3 && acc.Type != gltf.VEC4 {
+			return nil, errors.New("COLOR_0 accessor must be VEC3 or VEC4")
+		}
+		colors0IsVec4 = acc.Type == gltf.VEC4
+		colors0, err = gltfReadAccessorFloats(doc, acc)
+		if err != nil {
+			return nil, err
+		}
 	}
-	if !(tan == nil || tanAcc.ComponentType == gltf.FLOAT && tanAcc.Type == gltf.VEC4) {
-		return []rendering.Vertex{}, errors.New("tan == NULL || tanAcc.ComponentType == gltf.ComponentFloat && tanAcc.Type == gltf.AccessorVec4")
-	}
-	if !(tex0 == nil || tex0Acc.ComponentType == gltf.FLOAT && tex0Acc.Type == gltf.VEC2) {
-		return []rendering.Vertex{}, errors.New("tex0 == NULL || tex0Acc.ComponentType == gltf.ComponentFloat && tex0Acc.Type == gltf.AccessorVec2")
-	}
-	if !(tex1 == nil || tex1Acc.ComponentType == gltf.FLOAT && tex1Acc.Type == gltf.VEC2) {
-		return []rendering.Vertex{}, errors.New("tex1 == NULL || tex1Acc.ComponentType == gltf.ComponentFloat && tex1Acc.Type == gltf.AccessorVec2")
-	}
+
 	vertData := make([]rendering.Vertex, vertCount)
 	vertColor := matrix.ColorWhite()
-	if mesh.Primitives[0].Material != nil && len(doc.glTF.Materials) > int(*mesh.Primitives[0].Material) {
-		mat := doc.glTF.Materials[*mesh.Primitives[0].Material]
+	if prim.Material != nil && *prim.Material >= 0 && int(*prim.Material) < len(doc.glTF.Materials) {
+		mat := doc.glTF.Materials[*prim.Material]
 		if mat.PBRMetallicRoughness.BaseColorFactor != nil {
 			vertColor = *mat.PBRMetallicRoughness.BaseColorFactor
 		}
 	}
-	for i := int32(0); i < vertCount; i++ {
-		vertData[i].Position = matrix.Vec3FromSlice(verts)
-		verts = verts[3:]
-		vertData[i].Color = vertColor
-		vertData[i].MorphTarget = vertData[i].Position
-		// NAN is being exported for colors, so skipping this line
-		// vertData[j].color = (vertColors != NULL ? ((color*)vertColors)[j] : color_white());
-		vertData[i].Color.MultiplyAssign(vertColor)
-		joint := [4]int32{0, 0, 0, 0}
-		const jointSize = uint64(unsafe.Sizeof(joint))
-		if len(jointIds) > 0 {
-			switch jnt0Acc.ComponentType {
-			case gltf.UNSIGNED_BYTE:
-				joint[0] = int32(jointIds[0])
-				joint[1] = int32(jointIds[1])
-				joint[2] = int32(jointIds[2])
-				joint[3] = int32(jointIds[3])
-				jointIds = jointIds[4:]
-			case gltf.UNSIGNED_SHORT:
-				ptr := klib.ByteSliceToUInt16Slice(jointIds)
-				joint[0] = int32(ptr[0])
-				joint[1] = int32(ptr[1])
-				joint[2] = int32(ptr[2])
-				joint[3] = int32(ptr[3])
-				jointIds = jointIds[4*2:]
-			default:
-				klib.Memcpy(unsafe.Pointer(&joint[0]), unsafe.Pointer(&jointIds[0]), jointSize)
-				jointIds = jointIds[jointSize:]
+	for i := 0; i < vertCount; i++ {
+		vertData[i].Position = matrix.NewVec3(
+			matrix.Float(positions[i*3+0]),
+			matrix.Float(positions[i*3+1]),
+			matrix.Float(positions[i*3+2]),
+		)
+		if colors0IsVec4 && len(colors0) >= (i+1)*4 {
+			vertData[i].Color = matrix.Color{
+				matrix.Float(colors0[i*4+0]) * vertColor[matrix.R],
+				matrix.Float(colors0[i*4+1]) * vertColor[matrix.G],
+				matrix.Float(colors0[i*4+2]) * vertColor[matrix.B],
+				matrix.Float(colors0[i*4+3]) * vertColor[matrix.A],
 			}
+		} else if !colors0IsVec4 && len(colors0) >= (i+1)*3 {
+			vertData[i].Color = matrix.Color{
+				matrix.Float(colors0[i*3+0]) * vertColor[matrix.R],
+				matrix.Float(colors0[i*3+1]) * vertColor[matrix.G],
+				matrix.Float(colors0[i*3+2]) * vertColor[matrix.B],
+				vertColor[matrix.A],
+			}
+		} else {
+			vertData[i].Color = vertColor
 		}
-		vertData[i].JointIds = matrix.Vec4i{joint[0], joint[1], joint[2], joint[3]}
-		if len(weights) > 0 {
-			vertData[i].JointWeights = matrix.Vec4FromSlice(weights)
-			weights = weights[4:]
+		vertData[i].MorphTarget = vertData[i].Position
+		if len(jointIDs) >= (i+1)*4 {
+			vertData[i].JointIds = matrix.Vec4i{jointIDs[i*4+0], jointIDs[i*4+1], jointIDs[i*4+2], jointIDs[i*4+3]}
+		}
+		if len(weights) >= (i+1)*4 {
+			vertData[i].JointWeights = matrix.NewVec4(
+				matrix.Float(weights[i*4+0]),
+				matrix.Float(weights[i*4+1]),
+				matrix.Float(weights[i*4+2]),
+				matrix.Float(weights[i*4+3]),
+			)
 		} else {
 			vertData[i].JointWeights = matrix.Vec4Zero()
 		}
-		vertData[i].Normal = matrix.Vec3FromSlice(vertNormals)
-		vertNormals = vertNormals[3:]
-		if tangent != nil {
-			vertData[i].Tangent = matrix.Vec4FromSlice(tangent)
-			tangent = tangent[4:]
+		if len(normals) >= (i+1)*3 {
+			vertData[i].Normal = matrix.NewVec3(
+				matrix.Float(normals[i*3+0]),
+				matrix.Float(normals[i*3+1]),
+				matrix.Float(normals[i*3+2]),
+			)
+		} else {
+			vertData[i].Normal = matrix.Vec3Zero()
+		}
+		if len(tangents) >= (i+1)*4 {
+			vertData[i].Tangent = matrix.NewVec4(
+				matrix.Float(tangents[i*4+0]),
+				matrix.Float(tangents[i*4+1]),
+				matrix.Float(tangents[i*4+2]),
+				matrix.Float(tangents[i*4+3]),
+			)
 		} else {
 			vertData[i].Tangent = matrix.Vec4Zero()
 		}
-		if texCoords0 != nil {
-			vertData[i].UV0 = matrix.Vec2FromSlice(texCoords0)
-			texCoords0 = texCoords0[2:]
+		if len(texCoords0) >= (i+1)*2 {
+			vertData[i].UV0 = matrix.NewVec2(matrix.Float(texCoords0[i*2+0]), matrix.Float(texCoords0[i*2+1]))
 		} else {
 			vertData[i].UV0 = matrix.Vec2Zero()
 		}
-		for vertData[i].UV0.X() > 1.0 {
-			vertData[i].UV0[matrix.Vx] -= 1.0
-		}
-		for vertData[i].UV0.Y() > 1.0 {
-			vertData[i].UV0[matrix.Vy] -= 1.0
-		}
 	}
-	errs := gltfReadMeshMorphTargets(mesh, doc, vertData)
-	return vertData, errs.First()
+	if err := gltfReadMeshMorphTargets(mesh, doc, primitive, vertData); err != nil {
+		return nil, err
+	}
+	return vertData, nil
 }
 
-func gltfReadMeshIndices(mesh *gltf.Mesh, doc *fullGLTF, primitive int) ([]uint32, error) {
+func gltfReadMeshIndices(mesh *gltf.Mesh, doc *fullGLTF, primitive int, vertexCount int) ([]uint32, error) {
 	defer tracing.NewRegion("loaders.gltfReadMeshIndices").End()
-	idx := mesh.Primitives[primitive].Indices
-	view := doc.glTF.BufferViews[idx]
-	acc := doc.glTF.Accessors[idx]
-	indices := doc.bins[view.Buffer][view.ByteOffset:]
-	indicesSize := view.ByteLength
-	if !(indicesSize > 0) {
-		return []uint32{}, errors.New("indicesCount > 0")
+	if primitive < 0 || primitive >= len(mesh.Primitives) {
+		return nil, fmt.Errorf("invalid primitive index %d", primitive)
 	}
-	var convertedIndices []uint32
+	idxPtr := mesh.Primitives[primitive].Indices
+	if idxPtr == nil {
+		indices := make([]uint32, vertexCount)
+		for i := range indices {
+			indices[i] = uint32(i)
+		}
+		return indices, nil
+	}
+	acc, err := gltfAccessorByIntIndex(doc, *idxPtr)
+	if err != nil {
+		return nil, err
+	}
+	if acc.Type != gltf.SCALAR {
+		return nil, errors.New("index accessor must be SCALAR")
+	}
 	switch acc.ComponentType {
-	case gltf.BYTE:
-		fallthrough
-	case gltf.UNSIGNED_BYTE:
-		indicesCount := indicesSize
-		convertedIndices = make([]uint32, indicesSize)
-		for i := int32(0); i < indicesCount; i++ {
-			convertedIndices[i] = uint32(indices[i])
-		}
-	case gltf.SHORT:
-		fallthrough
-	case gltf.UNSIGNED_SHORT:
-		indicesCount := indicesSize / 2
-		convertedIndices = make([]uint32, indicesCount)
-		vals := unsafe.Slice((*uint16)(unsafe.Pointer(&indices[0])), indicesCount)
-		for i := int32(0); i < indicesCount; i++ {
-			convertedIndices[i] = uint32(vals[i])
-		}
-	case gltf.UNSIGNED_INT:
-		fallthrough
-	case gltf.FLOAT:
-		indicesCount := indicesSize / 4
-		convertedIndices = make([]uint32, indicesCount)
-		vals := unsafe.Slice((*uint32)(unsafe.Pointer(&indices[0])), indicesCount)
-		for i := int32(0); i < indicesCount; i++ {
-			convertedIndices[i] = uint32(vals[i])
-		}
+	case gltf.UNSIGNED_BYTE, gltf.UNSIGNED_SHORT, gltf.UNSIGNED_INT:
+		// valid
 	default:
-		return []uint32{}, errors.New("invalid component type")
+		return nil, errors.New("index accessor must use an unsigned integer component type")
 	}
-	return convertedIndices, nil
+	values, err := gltfReadAccessorInts(doc, acc)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]uint32, len(values))
+	for i, v := range values {
+		out[i] = uint32(v)
+	}
+	return out, nil
 }
 
 func gltfReadMeshTextures(mesh *gltf.Mesh, doc *gltf.GLTF, primitive int) map[string]string {
 	defer tracing.NewRegion("loaders.gltfReadMeshTextures").End()
 	textures := make(map[string]string)
-	if len(doc.Materials) == 0 || mesh.Primitives[primitive].Material == nil {
+	if primitive < 0 || primitive >= len(mesh.Primitives) || len(doc.Materials) == 0 || mesh.Primitives[primitive].Material == nil {
 		return textures
 	}
 	uri := func(path string) string {
-		return filepath.ToSlash(filepath.Join(filepath.Dir(doc.Asset.FilePath), path))
+		if strings.HasPrefix(strings.ToLower(path), "data:") {
+			return path
+		}
+		return filepath.ToSlash(filepath.Join(filepath.Dir(doc.Asset.FilePath), filepath.FromSlash(path)))
+	}
+	resolveTexture := func(texID *gltf.TextureId) string {
+		if texID == nil || texID.Index < 0 || int(texID.Index) >= len(doc.Textures) {
+			return ""
+		}
+		tex := doc.Textures[texID.Index]
+		if tex.Source == nil || *tex.Source < 0 || int(*tex.Source) >= len(doc.Images) {
+			return ""
+		}
+		img := doc.Images[*tex.Source]
+		if img.URI != "" {
+			return uri(img.URI)
+		}
+		// Embedded bufferView images require a byte-based texture API, not a path string.
+		return ""
 	}
 	mat := doc.Materials[*mesh.Primitives[primitive].Material]
-	if mat.PBRMetallicRoughness.BaseColorTexture != nil {
-		textures["baseColor"] = uri(doc.Images[mat.PBRMetallicRoughness.BaseColorTexture.Index].URI)
+	if path := resolveTexture(mat.PBRMetallicRoughness.BaseColorTexture); path != "" {
+		textures["baseColor"] = path
 	}
-	if mat.PBRMetallicRoughness.MetallicRoughnessTexture != nil {
-		textures["metallicRoughness"] = uri(doc.Images[mat.PBRMetallicRoughness.MetallicRoughnessTexture.Index].URI)
+	if path := resolveTexture(mat.PBRMetallicRoughness.MetallicRoughnessTexture); path != "" {
+		textures["metallicRoughness"] = path
 	}
-	if mat.NormalTexture != nil {
-		textures["normal"] = uri(doc.Images[mat.NormalTexture.Index].URI)
+	if path := resolveTexture(mat.NormalTexture); path != "" {
+		textures["normal"] = path
 	}
-	if mat.OcclusionTexture != nil {
-		textures["occlusion"] = uri(doc.Images[mat.OcclusionTexture.Index].URI)
+	if path := resolveTexture(mat.OcclusionTexture); path != "" {
+		textures["occlusion"] = path
 	}
-	if mat.EmissiveTexture != nil {
-		textures["emissive"] = uri(doc.Images[mat.EmissiveTexture.Index].URI)
+	if path := resolveTexture(mat.EmissiveTexture); path != "" {
+		textures["emissive"] = path
 	}
 	return textures
 }
@@ -534,66 +992,112 @@ func gltfReadAnimations(doc *fullGLTF) []load_result.Animation {
 	anims := make([]load_result.Animation, len(doc.glTF.Animations))
 	for i := range doc.glTF.Animations {
 		a := &doc.glTF.Animations[i]
-		anims[i] = load_result.Animation{
-			Name:   a.Name,
-			Frames: make([]load_result.AnimKeyFrame, 0),
-		}
-		for j := range doc.glTF.Animations[i].Channels {
+		anims[i] = load_result.Animation{Name: a.Name, Frames: make([]load_result.AnimKeyFrame, 0)}
+		for j := range a.Channels {
 			c := a.Channels[j]
+			if c.Sampler < 0 || int(c.Sampler) >= len(a.Samplers) {
+				continue
+			}
 			sampler := &a.Samplers[c.Sampler]
-			inAcc := &doc.glTF.Accessors[sampler.Input]
-			outAcc := &doc.glTF.Accessors[sampler.Output]
-			// Times ([]float32) of the key frames of the animation
-			in := gltfViewBytes(doc, &doc.glTF.BufferViews[inAcc.BufferView])
-			// Values for the animated properties at the respective key frames
-			out := gltfViewBytes(doc, &doc.glTF.BufferViews[outAcc.BufferView])
-			fIn := klib.ByteSliceToFloat32Slice(in)
-			fOut := klib.ByteSliceToFloat32Slice(out)
-			for k := 0; k < len(fIn); k++ {
-				var key *load_result.AnimKeyFrame = nil
+			inAcc, err := gltfAccessorByIntIndex(doc, sampler.Input)
+			if err != nil {
+				continue
+			}
+			outAcc, err := gltfAccessorByIntIndex(doc, sampler.Output)
+			if err != nil {
+				continue
+			}
+			if inAcc.Type != gltf.SCALAR {
+				continue
+			}
+			times, err := gltfReadAccessorFloats(doc, inAcc)
+			if err != nil {
+				continue
+			}
+			values, err := gltfReadAccessorFloats(doc, outAcc)
+			if err != nil {
+				continue
+			}
+			bone := load_result.AnimBone{
+				PathType:      c.Target.Path(),
+				Interpolation: sampler.Interpolation(),
+				NodeIndex:     int(c.Target.Node),
+			}
+			if bone.Interpolation == load_result.AnimInterpolateInvalid {
+				bone.Interpolation = load_result.AnimInterpolateLinear
+			}
+			components := 0
+			switch bone.PathType {
+			case load_result.AnimPathTranslation, load_result.AnimPathScale:
+				components = 3
+			case load_result.AnimPathRotation:
+				components = 4
+			case load_result.AnimPathWeights:
+				// Current load_result.AnimBone only stores up to four components and has no morph target indexing.
+				continue
+			default:
+				continue
+			}
+			valuesPerKey := components
+			if bone.Interpolation == load_result.AnimInterpolateCubicSpline {
+				valuesPerKey = components * 3
+			}
+			if len(values) < len(times)*valuesPerKey {
+				continue
+			}
+			for k := 0; k < len(times); k++ {
+				var key *load_result.AnimKeyFrame
 				for l := range anims[i].Frames {
-					if matrix.Approx(anims[i].Frames[l].Time, fIn[k]) {
+					if matrix.Approx(anims[i].Frames[l].Time, times[k]) {
 						key = &anims[i].Frames[l]
 						break
 					}
 				}
 				if key == nil {
-					anims[i].Frames = append(anims[i].Frames, load_result.AnimKeyFrame{
-						Bones: make([]load_result.AnimBone, 0),
-						Time:  fIn[k],
-					})
+					anims[i].Frames = append(anims[i].Frames, load_result.AnimKeyFrame{Bones: make([]load_result.AnimBone, 0), Time: times[k]})
 					key = &anims[i].Frames[len(anims[i].Frames)-1]
 				}
-				bone := load_result.AnimBone{
-					PathType:      c.Target.Path(),
-					Interpolation: sampler.Interpolation(),
-					NodeIndex:     int(c.Target.Node),
+				thisBone := bone
+				valueOffset := k * valuesPerKey
+				if bone.Interpolation == load_result.AnimInterpolateCubicSpline {
+					valueOffset += components // skip in-tangent, keep the actual key value
 				}
 				switch bone.PathType {
-				case load_result.AnimPathTranslation:
-					bone.Data = matrix.Vec3FromSlice(fOut).AsAligned16()
-					fOut = fOut[3:]
+				case load_result.AnimPathTranslation, load_result.AnimPathScale:
+					vec := matrix.NewVec3(
+						matrix.Float(values[valueOffset+0]),
+						matrix.Float(values[valueOffset+1]),
+						matrix.Float(values[valueOffset+2]),
+					)
+					thisBone.Data = vec.AsAligned16()
 				case load_result.AnimPathRotation:
-					// glTF has the specification as XYZW instead of WXYZ
-					bone.Data = matrix.QuaternionFromXYZWSlice(fOut)
-					fOut = fOut[4:]
-				case load_result.AnimPathScale:
-					bone.Data = matrix.Vec3FromSlice(fOut).AsAligned16()
-					fOut = fOut[3:]
-				case load_result.AnimPathWeights:
-					// TODO:  Implement reading weights data
+					q := matrix.QuaternionFromXYZW([4]matrix.Float{
+						matrix.Float(values[valueOffset+0]),
+						matrix.Float(values[valueOffset+1]),
+						matrix.Float(values[valueOffset+2]),
+						matrix.Float(values[valueOffset+3]),
+					})
+					thisBone.Data = [4]matrix.Float{q.W(), q.X(), q.Y(), q.Z()}
 				}
-				key.Bones = append(key.Bones, bone)
+				key.Bones = append(key.Bones, thisBone)
 			}
 		}
 		slices.SortFunc(anims[i].Frames, func(a, b load_result.AnimKeyFrame) int {
-			return int((a.Time - b.Time) * 10000)
+			switch {
+			case a.Time < b.Time:
+				return -1
+			case a.Time > b.Time:
+				return 1
+			default:
+				return 0
+			}
 		})
-		// Convert frame from absolute time to relative time length
-		for j := range anims[i].Frames[:len(anims[i].Frames)-1] {
+		if len(anims[i].Frames) == 0 {
+			continue
+		}
+		for j := 0; j < len(anims[i].Frames)-1; j++ {
 			anims[i].Frames[j].Time = anims[i].Frames[j+1].Time - anims[i].Frames[j].Time
 		}
-		// Last frame should be a goal and not have time?
 		anims[i].Frames[len(anims[i].Frames)-1].Time = 0.0
 	}
 	return anims

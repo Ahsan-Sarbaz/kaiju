@@ -38,10 +38,28 @@ package gltf
 
 import (
 	"encoding/json"
+	"strings"
+
 	"kaijuengine.com/matrix"
 	"kaijuengine.com/rendering/loaders/load_result"
-	"strings"
 )
+
+type SparseIndices struct {
+	BufferView    int32         `json:"bufferView"`
+	ByteOffset    int32         `json:"byteOffset"`
+	ComponentType ComponentType `json:"componentType"`
+}
+
+type SparseValues struct {
+	BufferView int32 `json:"bufferView"`
+	ByteOffset int32 `json:"byteOffset"`
+}
+
+type Sparse struct {
+	Count   int32         `json:"count"`
+	Indices SparseIndices `json:"indices"`
+	Values  SparseValues  `json:"values"`
+}
 
 type Asset struct {
 	Generator string `json:"generator"`
@@ -61,12 +79,11 @@ type Node struct {
 	Camera      *int32         `json:"camera"`
 	Skin        *int32         `json:"skin"`
 	Matrix      *matrix.Mat4   `json:"matrix"`
-	Rotation    *matrix.Vec4   `json:"rotation"` // Vec4 because glTF XYZW on quat
+	Rotation    *matrix.Vec4   `json:"rotation"`
 	Scale       *matrix.Vec3   `json:"scale"`
 	Translation *matrix.Vec3   `json:"translation"`
 	Weights     []float32      `json:"weights"`
 	Extras      map[string]any `json:"extras"`
-	//Extensions  interface{}       `json:"extensions"`
 }
 
 type ChannelTarget struct {
@@ -101,7 +118,7 @@ type AnimationSampler struct {
 
 func (a *AnimationSampler) Interpolation() load_result.AnimationInterpolation {
 	switch a.InterpolationStr {
-	case "LINEAR":
+	case "", "LINEAR":
 		return load_result.AnimInterpolateLinear
 	case "STEP":
 		return load_result.AnimInterpolateStep
@@ -118,7 +135,8 @@ type Animation struct {
 }
 
 type TextureId struct {
-	Index int32 `json:"index"`
+	Index    int32 `json:"index"`
+	TexCoord int32 `json:"texCoord"`
 }
 
 type PBRMetallicRoughness struct {
@@ -129,12 +147,38 @@ type PBRMetallicRoughness struct {
 	BaseColorFactor          *matrix.Color `json:"baseColorFactor"`
 }
 
+func (p *PBRMetallicRoughness) UnmarshalJSON(data []byte) error {
+	type alias PBRMetallicRoughness
+	tmp := struct {
+		*alias
+		MetallicFactor  *float32 `json:"metallicFactor"`
+		RoughnessFactor *float32 `json:"roughnessFactor"`
+	}{alias: (*alias)(p)}
+	if err := json.Unmarshal(data, &tmp); err != nil {
+		return err
+	}
+	if tmp.MetallicFactor != nil {
+		p.MetallicFactor = *tmp.MetallicFactor
+	} else {
+		p.MetallicFactor = 1.0
+	}
+	if tmp.RoughnessFactor != nil {
+		p.RoughnessFactor = *tmp.RoughnessFactor
+	} else {
+		p.RoughnessFactor = 1.0
+	}
+	return nil
+}
+
 type Material struct {
 	Name                 string               `json:"name"`
 	DoubleSided          bool                 `json:"doubleSided"`
 	NormalTexture        *TextureId           `json:"normalTexture"`
 	OcclusionTexture     *TextureId           `json:"occlusionTexture"`
 	EmissiveTexture      *TextureId           `json:"emissiveTexture"`
+	EmissiveFactor       [3]float32           `json:"emissiveFactor"`
+	AlphaMode            string               `json:"alphaMode"`
+	AlphaCutoff          float32              `json:"alphaCutoff"`
 	PBRMetallicRoughness PBRMetallicRoughness `json:"pbrMetallicRoughness"`
 }
 
@@ -150,7 +194,7 @@ type Target struct {
 
 type Primitive struct {
 	Attributes map[string]uint32 `json:"attributes"`
-	Indices    int32             `json:"indices"`
+	Indices    *int32            `json:"indices"`
 	Material   *int32            `json:"material"`
 	Mode       int32             `json:"mode"`
 	Targets    []Target          `json:"targets"`
@@ -165,34 +209,39 @@ type Mesh struct {
 
 type Skin struct {
 	Name                string  `json:"name"`
-	InverseBindMatrices int32   `json:"inverseBindMatrices"`
+	InverseBindMatrices *int32  `json:"inverseBindMatrices"`
 	Joints              []int32 `json:"joints"`
 }
 
 type Texture struct {
-	Sampler int32 `json:"sampler"`
-	Source  int32 `json:"source"`
+	Sampler *int32 `json:"sampler"`
+	Source  *int32 `json:"source"`
 }
 
 type Image struct {
-	Name     string `json:"name"`
-	URI      string `json:"uri"`
-	MimeType string `json:"mimeType"`
+	Name       string `json:"name"`
+	URI        string `json:"uri"`
+	MimeType   string `json:"mimeType"`
+	BufferView *int32 `json:"bufferView"`
 }
 
 type Accessor struct {
-	BufferView    int32         `json:"bufferView"`
+	BufferView    *int32        `json:"bufferView"`
+	ByteOffset    int32         `json:"byteOffset"`
 	ComponentType ComponentType `json:"componentType"`
+	Normalized    bool          `json:"normalized"`
 	Count         int32         `json:"count"`
-	Max           matrix.Vec3   `json:"max"`
-	Min           matrix.Vec3   `json:"min"`
+	Max           []float32     `json:"max"`
+	Min           []float32     `json:"min"`
 	Type          AccessorType  `json:"type"`
+	Sparse        *Sparse       `json:"sparse"`
 }
 
 type BufferView struct {
 	Buffer     int32 `json:"buffer"`
 	ByteLength int32 `json:"byteLength"`
 	ByteOffset int32 `json:"byteOffset"`
+	ByteStride int32 `json:"byteStride"`
 	Target     int32 `json:"target"`
 }
 

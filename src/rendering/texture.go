@@ -38,14 +38,16 @@ package rendering
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"image"
 	"image/draw"
 	"image/png"
+	"strings"
+
 	"kaijuengine.com/engine/assets"
 	"kaijuengine.com/matrix"
 	"kaijuengine.com/platform/profiler/tracing"
-	"strings"
 
 	"github.com/KaijuEngine/uuid"
 )
@@ -92,6 +94,22 @@ const (
 	TextureInputTypeRgba8
 	TextureInputTypeRgb8
 	TextureInputTypeLuminance
+	TextureInputTypeCompressedBc1RgbUnorm
+	TextureInputTypeCompressedBc1RgbSrgb
+	TextureInputTypeCompressedBc1RgbaUnorm
+	TextureInputTypeCompressedBc1RgbaSrgb
+	TextureInputTypeCompressedBc2Unorm
+	TextureInputTypeCompressedBc2Srgb
+	TextureInputTypeCompressedBc3Unorm
+	TextureInputTypeCompressedBc3Srgb
+	TextureInputTypeCompressedBc4Unorm
+	TextureInputTypeCompressedBc4Snorm
+	TextureInputTypeCompressedBc5Unorm
+	TextureInputTypeCompressedBc5Snorm
+	TextureInputTypeCompressedBc6hUfloat
+	TextureInputTypeCompressedBc6hSfloat
+	TextureInputTypeCompressedBc7Unorm
+	TextureInputTypeCompressedBc7Srgb
 )
 
 const (
@@ -116,6 +134,7 @@ const (
 	TextureFileFormatAstc TextureFileFormat = iota
 	TextureFileFormatPng
 	TextureFileFormatRaw
+	TextureFileFormatDds
 )
 
 const (
@@ -139,6 +158,13 @@ type GPUImageWriteRequest struct {
 	Pixels []byte
 }
 
+type TextureMipLayout struct {
+	Width  int
+	Height int
+	Offset int
+	Size   int
+}
+
 type TextureData struct {
 	Mem            []byte
 	InternalFormat TextureInputType
@@ -148,6 +174,7 @@ type TextureData struct {
 	Height         int
 	InputType      TextureFileFormat
 	Dimensions     TextureDimensions
+	Mips           []TextureMipLayout
 }
 
 type transparencyReadState int
@@ -250,6 +277,149 @@ func ReadRawTextureData(mem []byte, inputType TextureFileFormat) TextureData {
 		res.InternalFormat = TextureInputTypeRgba8
 		res.Format = TextureColorFormatRgbaUnorm
 		res.Type = TextureMemTypeUnsignedByte
+
+	case TextureFileFormatDds:
+		// DDS header layout (all fields little-endian):
+		//   [0:4]     magic "DDS "
+		//   [4:8]     dwSize (124)
+		//   [8:12]    dwFlags
+		//   [12:16]   dwHeight
+		//   [16:20]   dwWidth
+		//   [28:32]   dwMipMapCount
+		//   [80:84]   ddspf.dwFlags  (DDPF_FOURCC=0x4, DDPF_RGB=0x40)
+		//   [84:88]   ddspf.dwFourCC
+		//   DX10 extended header starts at [128], data follows at [148]
+		if len(mem) < 128 {
+			return res
+		}
+		width := int(binary.LittleEndian.Uint32(mem[16:20]))
+		height := int(binary.LittleEndian.Uint32(mem[12:16]))
+		ddpfFlags := binary.LittleEndian.Uint32(mem[80:84])
+		mipCount := int(binary.LittleEndian.Uint32(mem[28:32]))
+		if mipCount == 0 {
+			mipCount = 1
+		}
+		fourCC := mem[84:88]
+		dataOffset := 128
+		parsed := true
+		swizzleMipData := false
+
+		const ddpfFourCC = 0x4
+		const ddpfRgb = 0x40
+		const ddpfAlphaPixels = 0x1
+
+		if bytes.Equal(fourCC, []byte("DX10")) {
+			if len(mem) < 148 {
+				return res
+			}
+			dxgiFormat := binary.LittleEndian.Uint32(mem[128:132])
+			dataOffset = 148
+			switch dxgiFormat {
+			case 71: // DXGI_FORMAT_BC1_UNORM
+				res.InternalFormat = TextureInputTypeCompressedBc1RgbaUnorm
+			case 72: // DXGI_FORMAT_BC1_UNORM_SRGB
+				res.InternalFormat = TextureInputTypeCompressedBc1RgbaSrgb
+			case 74: // DXGI_FORMAT_BC2_UNORM
+				res.InternalFormat = TextureInputTypeCompressedBc2Unorm
+			case 75: // DXGI_FORMAT_BC2_UNORM_SRGB
+				res.InternalFormat = TextureInputTypeCompressedBc2Srgb
+			case 77: // DXGI_FORMAT_BC3_UNORM
+				res.InternalFormat = TextureInputTypeCompressedBc3Unorm
+			case 78: // DXGI_FORMAT_BC3_UNORM_SRGB
+				res.InternalFormat = TextureInputTypeCompressedBc3Srgb
+			case 80: // DXGI_FORMAT_BC4_UNORM
+				res.InternalFormat = TextureInputTypeCompressedBc4Unorm
+			case 81: // DXGI_FORMAT_BC4_SNORM
+				res.InternalFormat = TextureInputTypeCompressedBc4Snorm
+			case 83: // DXGI_FORMAT_BC5_UNORM
+				res.InternalFormat = TextureInputTypeCompressedBc5Unorm
+			case 84: // DXGI_FORMAT_BC5_SNORM
+				res.InternalFormat = TextureInputTypeCompressedBc5Snorm
+			case 95: // DXGI_FORMAT_BC6H_UF16
+				res.InternalFormat = TextureInputTypeCompressedBc6hUfloat
+			case 96: // DXGI_FORMAT_BC6H_SF16
+				res.InternalFormat = TextureInputTypeCompressedBc6hSfloat
+			case 98: // DXGI_FORMAT_BC7_UNORM
+				res.InternalFormat = TextureInputTypeCompressedBc7Unorm
+			case 99: // DXGI_FORMAT_BC7_UNORM_SRGB
+				res.InternalFormat = TextureInputTypeCompressedBc7Srgb
+			case 28: // DXGI_FORMAT_R8G8B8A8_UNORM
+				res.InternalFormat = TextureInputTypeRgba8
+				res.Format = TextureColorFormatRgbaUnorm
+			case 29: // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+				res.InternalFormat = TextureInputTypeRgba8
+				res.Format = TextureColorFormatRgbaSrgb
+			case 87: // DXGI_FORMAT_B8G8R8A8_UNORM
+				res.InternalFormat = TextureInputTypeRgba8
+				res.Format = TextureColorFormatRgbaUnorm
+				swizzleMipData = true
+			case 91: // DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+				res.InternalFormat = TextureInputTypeRgba8
+				res.Format = TextureColorFormatRgbaSrgb
+				swizzleMipData = true
+			default:
+				parsed = false
+			}
+		} else if ddpfFlags&ddpfFourCC != 0 {
+			// Legacy compressed FourCC
+			switch string(fourCC) {
+			case "DXT1":
+				// DDPF_ALPHAPIXELS set -> 1-bit alpha (BC1 RGBA), absent -> opaque (BC1 RGB).
+				// Using RGBA for an opaque DXT1 decodes color0<=color1 blocks as transparent
+				// black instead of a lerped color, corrupting pixels across block rows.
+				if ddpfFlags&ddpfAlphaPixels != 0 {
+					res.InternalFormat = TextureInputTypeCompressedBc1RgbaUnorm
+				} else {
+					res.InternalFormat = TextureInputTypeCompressedBc1RgbUnorm
+				}
+			case "DXT3":
+				res.InternalFormat = TextureInputTypeCompressedBc2Unorm
+			case "DXT5":
+				res.InternalFormat = TextureInputTypeCompressedBc3Unorm
+			case "ATI1", "BC4U":
+				res.InternalFormat = TextureInputTypeCompressedBc4Unorm
+			case "ATI2", "BC5U":
+				res.InternalFormat = TextureInputTypeCompressedBc5Unorm
+			default:
+				parsed = false
+			}
+		} else if ddpfFlags&ddpfRgb != 0 {
+			// Legacy uncompressed RGB/RGBA: detect channel order via bit masks.
+			//   dwRBitMask at [92:96], dwBBitMask at [100:104]
+			rMask := binary.LittleEndian.Uint32(mem[92:96])
+			res.InternalFormat = TextureInputTypeRgba8
+			res.Format = TextureColorFormatRgbaUnorm
+			if rMask == 0x00FF0000 {
+				// BGRA ordering (R mask in bits 16-23) -> swizzle to RGBA
+				swizzleMipData = true
+			}
+		} else {
+			parsed = false
+		}
+
+		if !parsed {
+			return res
+		}
+
+		res.Width = width
+		res.Height = height
+		if len(mem) < dataOffset {
+			return TextureData{}
+		}
+		mips, pixels, ok := parseDDSMipLayouts(mem[dataOffset:], res.InternalFormat, width, height, mipCount)
+		if !ok {
+			return TextureData{}
+		}
+		if res.Mem == nil {
+			res.Mem = pixels
+		}
+		res.Mips = mips
+		res.Type = TextureMemTypeUnsignedByte
+		if swizzleMipData && len(res.Mem) > 0 && len(res.Mips) > 0 {
+			for _, mip := range res.Mips {
+				swizzleBgraToRgba(res.Mem[mip.Offset : mip.Offset+mip.Size])
+			}
+		}
 	}
 
 	return res
@@ -264,6 +434,8 @@ func (t *Texture) createData(imgBuff []byte, overrideWidth, overrideHeight int, 
 		inputType = TextureFileFormatPng
 	} else if len(imgBuff) > 4 && imgBuff[0] == '\x89' && imgBuff[1] == 'P' && imgBuff[2] == 'N' && imgBuff[3] == 'G' {
 		inputType = TextureFileFormatPng
+	} else if len(imgBuff) > 4 && imgBuff[0] == 'D' && imgBuff[1] == 'D' && imgBuff[2] == 'S' && imgBuff[3] == ' ' {
+		inputType = TextureFileFormatDds
 	}
 	data := ReadRawTextureData(imgBuff, inputType)
 	if data.Width == 0 {
@@ -412,4 +584,112 @@ func selectKey(req string) string {
 		return uuid.NewString()
 	}
 	return req
+}
+
+// swizzleBgraToRgba swaps the R and B channels in-place for a packed BGRA byte slice.
+func swizzleBgraToRgba(p []byte) {
+	for i := 0; i+3 < len(p); i += 4 {
+		p[i], p[i+2] = p[i+2], p[i]
+	}
+}
+
+func parseDDSMipLayouts(src []byte, inputType TextureInputType, width, height, mipCount int) ([]TextureMipLayout, []byte, bool) {
+	mips := make([]TextureMipLayout, 0, mipCount)
+	totalSize := 0
+	offset := 0
+	for level := range mipCount {
+		mipWidth := max(width>>level, 1)
+		mipHeight := max(height>>level, 1)
+		size := textureMipByteSize(inputType, mipWidth, mipHeight)
+		if size <= 0 || offset+size > len(src) {
+			return nil, nil, false
+		}
+		mips = append(mips, TextureMipLayout{
+			Width:  mipWidth,
+			Height: mipHeight,
+			Offset: totalSize,
+			Size:   size,
+		})
+		totalSize += size
+		offset += size
+	}
+	data := make([]byte, totalSize)
+	offset = 0
+	for _, mip := range mips {
+		copy(data[mip.Offset:mip.Offset+mip.Size], src[offset:offset+mip.Size])
+		offset += mip.Size
+	}
+	return mips, data, true
+}
+
+func textureMipByteSize(inputType TextureInputType, width, height int) int {
+	blockWidth, blockHeight, blockBytes, compressed := textureBlockInfo(inputType)
+	if compressed {
+		blocksWide := (width + blockWidth - 1) / blockWidth
+		blocksHigh := (height + blockHeight - 1) / blockHeight
+		return blocksWide * blocksHigh * blockBytes
+	}
+	switch inputType {
+	case TextureInputTypeRgba8:
+		return width * height * 4
+	case TextureInputTypeRgb8:
+		return width * height * 3
+	case TextureInputTypeLuminance:
+		return width * height
+	default:
+		return 0
+	}
+}
+
+func textureBlockInfo(inputType TextureInputType) (blockWidth, blockHeight, blockBytes int, compressed bool) {
+	switch inputType {
+	case TextureInputTypeCompressedBc1RgbUnorm,
+		TextureInputTypeCompressedBc1RgbSrgb,
+		TextureInputTypeCompressedBc1RgbaUnorm,
+		TextureInputTypeCompressedBc1RgbaSrgb,
+		TextureInputTypeCompressedBc4Unorm,
+		TextureInputTypeCompressedBc4Snorm:
+		return 4, 4, 8, true
+	case TextureInputTypeCompressedBc2Unorm,
+		TextureInputTypeCompressedBc2Srgb,
+		TextureInputTypeCompressedBc3Unorm,
+		TextureInputTypeCompressedBc3Srgb,
+		TextureInputTypeCompressedBc5Unorm,
+		TextureInputTypeCompressedBc5Snorm,
+		TextureInputTypeCompressedBc6hUfloat,
+		TextureInputTypeCompressedBc6hSfloat,
+		TextureInputTypeCompressedBc7Unorm,
+		TextureInputTypeCompressedBc7Srgb:
+		return 4, 4, 16, true
+	case TextureInputTypeCompressedRgbaAstc4x4:
+		return 4, 4, 16, true
+	case TextureInputTypeCompressedRgbaAstc5x4:
+		return 5, 4, 16, true
+	case TextureInputTypeCompressedRgbaAstc5x5:
+		return 5, 5, 16, true
+	case TextureInputTypeCompressedRgbaAstc6x5:
+		return 6, 5, 16, true
+	case TextureInputTypeCompressedRgbaAstc6x6:
+		return 6, 6, 16, true
+	case TextureInputTypeCompressedRgbaAstc8x5:
+		return 8, 5, 16, true
+	case TextureInputTypeCompressedRgbaAstc8x6:
+		return 8, 6, 16, true
+	case TextureInputTypeCompressedRgbaAstc8x8:
+		return 8, 8, 16, true
+	case TextureInputTypeCompressedRgbaAstc10x5:
+		return 10, 5, 16, true
+	case TextureInputTypeCompressedRgbaAstc10x6:
+		return 10, 6, 16, true
+	case TextureInputTypeCompressedRgbaAstc10x8:
+		return 10, 8, 16, true
+	case TextureInputTypeCompressedRgbaAstc10x10:
+		return 10, 10, 16, true
+	case TextureInputTypeCompressedRgbaAstc12x10:
+		return 12, 10, 16, true
+	case TextureInputTypeCompressedRgbaAstc12x12:
+		return 12, 12, 16, true
+	default:
+		return 0, 0, 0, false
+	}
 }

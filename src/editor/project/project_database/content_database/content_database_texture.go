@@ -43,10 +43,11 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
-	"kaijuengine.com/editor/project/project_file_system"
-	"kaijuengine.com/platform/profiler/tracing"
 	"os"
 	"path/filepath"
+
+	"kaijuengine.com/editor/project/project_file_system"
+	"kaijuengine.com/platform/profiler/tracing"
 
 	"golang.org/x/image/bmp"
 )
@@ -63,12 +64,24 @@ type TextureConfig struct{}
 
 func (Texture) Path() string       { return project_file_system.ContentTextureFolder }
 func (Texture) TypeName() string   { return "Texture" }
-func (Texture) ExtNames() []string { return []string{".png", ".jpg", ".jpeg", ".bmp"} }
+func (Texture) ExtNames() []string { return []string{".png", ".jpg", ".jpeg", ".bmp", ".dds"} }
 
 func (Texture) Import(src string, _ *project_file_system.FileSystem) (ProcessedImport, error) {
 	defer tracing.NewRegion("Texture.Import").End()
+	ext := filepath.Ext(src)
+	// DDS files are stored as-is; the rendering layer handles format detection
+	// and GPU upload of all BC-compressed variants directly.
+	if ext == ".dds" {
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return ProcessedImport{}, ImageImportError{err, "open"}
+		}
+		return ProcessedImport{Variants: []ImportVariant{
+			{Name: fileNameNoExt(src), Data: data},
+		}}, nil
+	}
 	var decoder func(r io.Reader) (image.Image, error) = nil
-	switch filepath.Ext(src) {
+	switch ext {
 	case ".png":
 		decoder = png.Decode
 	case ".jpg":

@@ -38,14 +38,15 @@ package rendering
 
 import (
 	"fmt"
-	"kaijuengine.com/matrix"
-	"kaijuengine.com/platform/profiler/tracing"
-	vk "kaijuengine.com/rendering/vulkan"
-	"kaijuengine.com/rendering/vulkan_const"
 	"log/slog"
 	"runtime"
 	"unsafe"
 	"weak"
+
+	"kaijuengine.com/matrix"
+	"kaijuengine.com/platform/profiler/tracing"
+	vk "kaijuengine.com/rendering/vulkan"
+	"kaijuengine.com/rendering/vulkan_const"
 )
 
 type TextureCleanup struct {
@@ -101,6 +102,38 @@ func (g *GPUDevice) setupTextureImpl(texture *Texture, data *TextureData) error 
 		format = GPUFormatAstc12x10SrgbBlock
 	case TextureInputTypeCompressedRgbaAstc12x12:
 		format = GPUFormatAstc12x12SrgbBlock
+	case TextureInputTypeCompressedBc1RgbUnorm:
+		format = GPUFormatBc1RgbUnormBlock
+	case TextureInputTypeCompressedBc1RgbSrgb:
+		format = GPUFormatBc1RgbSrgbBlock
+	case TextureInputTypeCompressedBc1RgbaUnorm:
+		format = GPUFormatBc1RgbaUnormBlock
+	case TextureInputTypeCompressedBc1RgbaSrgb:
+		format = GPUFormatBc1RgbaSrgbBlock
+	case TextureInputTypeCompressedBc2Unorm:
+		format = GPUFormatBc2UnormBlock
+	case TextureInputTypeCompressedBc2Srgb:
+		format = GPUFormatBc2SrgbBlock
+	case TextureInputTypeCompressedBc3Unorm:
+		format = GPUFormatBc3UnormBlock
+	case TextureInputTypeCompressedBc3Srgb:
+		format = GPUFormatBc3SrgbBlock
+	case TextureInputTypeCompressedBc4Unorm:
+		format = GPUFormatBc4UnormBlock
+	case TextureInputTypeCompressedBc4Snorm:
+		format = GPUFormatBc4SnormBlock
+	case TextureInputTypeCompressedBc5Unorm:
+		format = GPUFormatBc5UnormBlock
+	case TextureInputTypeCompressedBc5Snorm:
+		format = GPUFormatBc5SnormBlock
+	case TextureInputTypeCompressedBc6hUfloat:
+		format = GPUFormatBc6hUfloatBlock
+	case TextureInputTypeCompressedBc6hSfloat:
+		format = GPUFormatBc6hSfloatBlock
+	case TextureInputTypeCompressedBc7Unorm:
+		format = GPUFormatBc7UnormBlock
+	case TextureInputTypeCompressedBc7Srgb:
+		format = GPUFormatBc7SrgbBlock
 	case TextureInputTypeLuminance:
 		panic("Luminance textures are not supported")
 	}
@@ -114,8 +147,14 @@ func (g *GPUDevice) setupTextureImpl(texture *Texture, data *TextureData) error 
 	tile := GPUImageTilingOptimal
 	use := GPUImageUsageTransferSrcBit | GPUImageUsageTransferDstBit | GPUImageUsageSampledBit
 	props := GPUMemoryPropertyDeviceLocalBit
+	uploadMips := data.Mips
 	mip := texture.MipLevels
-	if mip <= 0 {
+	if len(uploadMips) > 0 {
+		if mip <= 0 || mip > len(uploadMips) {
+			mip = len(uploadMips)
+		}
+		uploadMips = uploadMips[:mip]
+	} else if mip <= 0 {
 		w, h := float32(width), float32(height)
 		mip = int(matrix.Floor(matrix.Log2(matrix.Max(w, h)))) + 1
 	}
@@ -168,15 +207,26 @@ func (g *GPUDevice) setupTextureImpl(texture *Texture, data *TextureData) error 
 	texture.RenderId.LayerCount = int(layerCount)
 	g.TransitionImageLayout(&texture.RenderId,
 		GPUImageLayoutTransferDstOptimal, GPUImageAspectColorBit,
-		texture.RenderId.Access, nil)
-	g.CopyBufferToImage(stagingBuffer, texture.RenderId.Image,
-		uint32(width), uint32(height), int(layerCount))
+		GPUAccessTransferWriteBit, nil)
+	if len(uploadMips) > 0 {
+		g.copyBufferToImageMipLevels(stagingBuffer, texture.RenderId.Image,
+			uploadMips, int(layerCount))
+	} else {
+		g.CopyBufferToImage(stagingBuffer, texture.RenderId.Image,
+			uint32(width), uint32(height), int(layerCount))
+	}
 	g.DestroyBuffer(stagingBuffer)
 	g.LogicalDevice.dbg.remove(stagingBuffer.handle)
 	g.FreeMemory(stagingBufferMemory)
 	g.LogicalDevice.dbg.remove(stagingBufferMemory.handle)
-	g.GenerateMipMaps(&texture.RenderId, format,
-		uint32(width), uint32(height), uint32(mip), filter)
+	if len(uploadMips) > 0 {
+		g.TransitionImageLayout(&texture.RenderId,
+			GPUImageLayoutShaderReadOnlyOptimal, GPUImageAspectColorBit,
+			GPUAccessShaderReadBit, nil)
+	} else {
+		g.GenerateMipMaps(&texture.RenderId, format,
+			uint32(width), uint32(height), uint32(mip), filter)
+	}
 	err = g.LogicalDevice.CreateImageView(&texture.RenderId,
 		GPUImageAspectColorBit, viewTypeFromDimensions(data))
 	if err != nil {
@@ -197,6 +247,41 @@ func (g *GPUDevice) setupTextureImpl(texture *Texture, data *TextureData) error 
 		})
 	}, TextureCleanup{texture.RenderId, weak.Make(g)})
 	return nil
+}
+
+func (g *GPUDevice) copyBufferToImageMipLevels(buffer GPUBuffer, image GPUImage, mips []TextureMipLayout, layerCount int) {
+	defer tracing.NewRegion("Vulkan.copyBufferToImageMipLevels").End()
+	cmd := g.beginSingleTimeCommands()
+	defer g.endSingleTimeCommands(cmd)
+	layerSize := 0
+	if len(mips) > 0 {
+		lastMip := mips[len(mips)-1]
+		layerSize = lastMip.Offset + lastMip.Size
+	}
+	for layer := range layerCount {
+		layerOffset := layer * layerSize
+		for level, mip := range mips {
+			region := vk.BufferImageCopy{
+				BufferOffset:      vk.DeviceSize(layerOffset + mip.Offset),
+				BufferRowLength:   0,
+				BufferImageHeight: 0,
+				ImageSubresource: vk.ImageSubresourceLayers{
+					AspectMask:     vk.ImageAspectFlags(vulkan_const.ImageAspectColorBit),
+					MipLevel:       uint32(level),
+					BaseArrayLayer: uint32(layer),
+					LayerCount:     1,
+				},
+				ImageOffset: vk.Offset3D{X: 0, Y: 0, Z: 0},
+				ImageExtent: vk.Extent3D{
+					Width:  uint32(mip.Width),
+					Height: uint32(mip.Height),
+					Depth:  1,
+				},
+			}
+			vk.CmdCopyBufferToImage(cmd.buffer, vk.Buffer(buffer.handle), vk.Image(image.handle),
+				vulkan_const.ImageLayoutTransferDstOptimal, 1, &region)
+		}
+	}
 }
 
 func (g *GPUDevice) generateMipMapsImpl(texId *TextureId, imageFormat GPUFormat, texWidth, texHeight, mipLevels uint32, filter GPUFilter) error {
